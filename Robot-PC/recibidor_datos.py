@@ -4,6 +4,7 @@ import time
 
 import numpy as np
 import cv2
+from ultralytics import YOLO
 
 # ========= Configuración =========
 ROBOT_IP   = "10.182.184.103"  # IP del TurtleBot4
@@ -12,6 +13,9 @@ ROBOT_PORT = 6000              # Debe coincidir con el nodo de telemetría
 DESIRED_DOMAIN_ID = 10          # Debe coincidir con ROS_DOMAIN_ID del robot
 PAIRING_CODE      = "ROBOT_A_100"
 EXPECTED_ROBOT_NAME = "turtlebot4_lite_10"  # por seguridad extra
+
+# Modelo YOLO
+MODEL_PATH = "../best.pt"  # Ruta al modelo entrenado
 
 
 def do_handshake(sock: socket.socket, robot_addr):
@@ -98,11 +102,12 @@ def handle_scan(parts):
         print(f"[SCAN] Error parseando mensaje: {e}")
 
 
-def handle_img(parts):
+def handle_img(parts, model):
     """
     parts: lista de strings del mensaje:
     IMG <domain_id> <robot_name> <sec> <nsec> <base64_jpeg>
     Como base64 puede tener espacios si algo raro pasa, juntamos desde índice 5.
+    model: modelo YOLO para detección
     """
     if len(parts) < 6:
         print("[IMG] Mensaje demasiado corto.")
@@ -125,8 +130,19 @@ def handle_img(parts):
             print("[IMG] Error al decodificar imagen.")
             return
 
-        # Mostrar con OpenCV
-        cv2.imshow(f"Camara {robot_name} (domain {domain_id})", img)
+        # Realizar detección con YOLO
+        results = model(img, conf=0.8, verbose=False)
+        
+        # Anotar imagen con detecciones
+        annotated_img = results[0].plot()
+        
+        # Contar robots detectados
+        num_robots = len(results[0].boxes)
+        if num_robots > 0:
+            print(f"[IMG] Detectados {num_robots} robot(s)")
+        
+        # Mostrar imagen anotada con OpenCV
+        cv2.imshow(f"Deteccion YOLO - {robot_name} (domain {domain_id})", annotated_img)
         cv2.waitKey(1)
 
     except Exception as e:
@@ -134,6 +150,15 @@ def handle_img(parts):
 
 
 def main():
+    # Cargar modelo YOLO
+    print(f"[MAIN] Cargando modelo YOLO desde {MODEL_PATH}...")
+    try:
+        model = YOLO(MODEL_PATH)
+        print(f"[MAIN] Modelo cargado. Clases: {model.names}")
+    except Exception as e:
+        print(f"[MAIN] Error al cargar modelo: {e}")
+        return
+    
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     # IMPORTANTE: el cliente puede usar cualquier puerto local
@@ -159,7 +184,7 @@ def main():
             if msg_type == "SCAN":
                 handle_scan(parts)
             elif msg_type == "IMG":
-                handle_img(parts)
+                handle_img(parts, model)
             else:
                 print(f"[MAIN] Mensaje desconocido desde {addr}: '{msg_type}'")
 
