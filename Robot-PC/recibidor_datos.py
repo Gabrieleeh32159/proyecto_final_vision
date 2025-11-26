@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🐕 Dog Follower - Sistema Modular
-Receiver: recibe cámara y detecta perro
+🤖 Robot Follower - Sistema Modular
+Receiver: recibe cámara y detecta robots con YOLO
 Sender: envía comandos de movimiento
 """
 
@@ -34,7 +34,7 @@ TARGET_AREA_RATIO = 0.15
 STOP_THRESHOLD = 0.05
 
 # Búsqueda girando
-SEARCH_ANGULAR_VEL = 0.5  # Gira a esta velocidad cuando no hay perro
+SEARCH_ANGULAR_VEL = 0.5  # Gira a esta velocidad cuando no hay robot
 
 
 # ========= HELPER FUNCTIONS =========
@@ -83,6 +83,10 @@ class Receiver:
         try:
             self.model = YOLO(model_path)
             print(f"✅ Modelo cargado. Clases: {self.model.names}")
+            # Verificar que la clase 'robots' existe
+            if 'robots' not in self.model.names.values():
+                print(f"⚠️  Advertencia: Clase 'robots' no encontrada en el modelo")
+                print(f"Clases disponibles: {list(self.model.names.values())}")
         except Exception as e:
             print(f"❌ Error cargando modelo: {e}")
             self.model = None
@@ -125,8 +129,8 @@ class Receiver:
             print(f"Error recibiendo: {e}")
             return None
     
-    def detect_dogs(self, img):
-        """Detecta perros en la imagen"""
+    def detect_robots(self, img):
+        """Detecta robots en la imagen usando YOLO"""
         if self.model is None or img is None:
             return []
         
@@ -136,6 +140,14 @@ class Receiver:
             
             for r in results:
                 for box in r.boxes:
+                    # Obtener clase detectada
+                    cls_id = int(box.cls[0])
+                    cls_name = self.model.names[cls_id]
+                    
+                    # Filtrar solo la clase 'robots'
+                    if cls_name != 'robots':
+                        continue
+                    
                     conf = float(box.conf[0])
                     xyxy = box.xyxy[0].cpu().numpy()
                     x1, y1, x2, y2 = xyxy
@@ -152,7 +164,8 @@ class Receiver:
                         'center': (cx, cy),
                         'area': area,
                         'width': width,
-                        'height': height
+                        'height': height,
+                        'class': cls_name
                     }
                     detections.append(detection)
             
@@ -172,24 +185,27 @@ class Receiver:
             cx, cy = det['center']
             conf = det['conf']
             
+            # Bounding box verde con mayor grosor
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            # Centro del robot
             cv2.circle(img, (cx, cy), 10, (0, 0, 255), -1)
-            cv2.putText(img, f"DOG {conf:.0%}", (x1, y1 - 15),
+            # Etiqueta con clase y confianza
+            cv2.putText(img, f"ROBOT {conf:.0%}", (x1, y1 - 15),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        # Líneas de referencia
+        # Líneas de referencia (centro de la imagen)
         cv2.line(img, (w//2, 0), (w//2, h), (255, 0, 0), 2)
         cv2.line(img, (0, h//2), (w, h//2), (255, 0, 0), 2)
         
         # Información
-        cv2.putText(img, f"Perros: {len(detections)}", (15, 40),
+        cv2.putText(img, f"Robots: {len(detections)}", (15, 40),
                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
         cv2.putText(img, f"vx={vx:.3f} m/s", (15, 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.putText(img, f"wz={wz:.3f} rad/s", (15, 120),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
-        # Estado
+        # Estado con colores
         if status == "SIGUIENDO":
             color = (0, 255, 255)
         elif status == "EN_OBJETIVO":
@@ -238,8 +254,8 @@ class Sender:
 
 
 # ========= CONTROLLER =========
-class DogFollower:
-    """Lógica principal de seguimiento"""
+class RobotFollower:
+    """Lógica principal de seguimiento de robots"""
     
     def __init__(self, receiver, sender):
         self.receiver = receiver
@@ -249,33 +265,33 @@ class DogFollower:
     def process_frame(self, img):
         """Procesa un frame y retorna comando + status"""
         
-        # Detectar perros
-        detections = self.receiver.detect_dogs(img)
+        # Detectar robots con YOLO
+        detections = self.receiver.detect_robots(img)
         
         h, w = img.shape[:2]
         
         if not detections:
-            # ❌ No hay perro: BUSCAR GIRANDO
+            # ❌ No hay robot: BUSCAR GIRANDO
             vx = 0.0
             wz = SEARCH_ANGULAR_VEL  # Girar en busca
             status = "BUSCANDO 🔄"
-            print(f"❌ Sin perro detectado - GIRANDO para buscar")
+            print(f"❌ Sin robot detectado - GIRANDO para buscar")
         
         else:
-            # ✅ Perro detectado: SEGUIR
-            best_dog = max(detections, key=lambda d: d['area'])
-            cx, cy = best_dog['center']
-            area = best_dog['area']
+            # ✅ Robot detectado: GIRAR Y AVANZAR HACIA ÉL
+            best_robot = max(detections, key=lambda d: d['area'])
+            cx, cy = best_robot['center']
+            area = best_robot['area']
             
             # Error angular (horizontal)
             frame_center_x = w / 2
             error_x = (cx - frame_center_x) / frame_center_x
             
-            # Error de distancia
+            # Error de distancia (invertido: si está lejos avanza, si está cerca retrocede)
             max_area = w * h * TARGET_AREA_RATIO
-            error_area = (area - max_area) / max_area
+            error_area = (max_area - area) / max_area  # Invertido para lógica correcta
             
-            # Control PID
+            # Control PID: girar para centrar y avanzar/retroceder según distancia
             wz = np.clip(KP_ANGULAR * error_x, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
             vx = np.clip(KP_LINEAR * error_area, -MAX_LINEAR_VEL, MAX_LINEAR_VEL)
             
@@ -284,10 +300,10 @@ class DogFollower:
                 vx = 0.0
                 wz = 0.0
                 status = "EN OBJETIVO ✅"
-                print(f"✅ Perro en posición objetivo")
+                print(f"✅ Robot en posición objetivo")
             else:
-                status = "SIGUIENDO 🐕"
-                print(f"🔄 SIGUIENDO | error_x={error_x:.2f} error_area={error_area:.2f} | "
+                status = "SIGUIENDO 🤖"
+                print(f"🔄 SIGUIENDO ROBOT | error_x={error_x:.2f} error_area={error_area:.2f} | "
                       f"vx={vx:.3f} m/s | wz={wz:.3f} rad/s")
         
         # Enviar comando
@@ -300,7 +316,7 @@ class DogFollower:
     
     def run(self):
         """Loop principal"""
-        print("\n🟢 Sistema iniciado - Siguiendo perro...")
+        print("\n🟢 Sistema iniciado - Siguiendo robots...")
         print("=" * 70)
         print("Presiona 'q' para salir")
         print("=" * 70 + "\n")
@@ -314,7 +330,7 @@ class DogFollower:
                 
                 img_annotated, status = self.process_frame(img)
                 
-                cv2.imshow("🐕 Dog Follower", img_annotated)
+                cv2.imshow("🤖 Robot Follower", img_annotated)
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
@@ -342,7 +358,7 @@ def main():
         sender = Sender()
         
         # Crear follower
-        follower = DogFollower(receiver, sender)
+        follower = RobotFollower(receiver, sender)
         
         # Ejecutar
         follower.run()
