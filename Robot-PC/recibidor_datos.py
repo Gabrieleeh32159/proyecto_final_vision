@@ -3,37 +3,113 @@ import base64
 import time
 import sys
 import os
+import math
 
 import numpy as np
 import cv2
 from ultralytics import YOLO
+from filterpy.kalman import KalmanFilter
 
 # Import tracker
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from tracker import HybridRobotTracker
 
 # ========= Configuración =========
-DESIRED_DOMAIN_ID = 10          # Debe coincidir con ROS_DOMAIN_ID del robot
-PAIRING_CODE      = "ROBOT_A_100"
-EXPECTED_ROBOT_NAME = "turtlebot4_lite_10"  # por seguriad extra
+DESIRED_DOMAIN_ID = 10
+PAIRING_CODE = "ROBOT_A_100"
+EXPECTED_ROBOT_NAME = "turtlebot4_lite_10"
 
-# Modelo YOLO
-MODEL_PATH = "../best.pt"  # Ruta al modelo entrenado
+MODEL_PATH = "../best.pt"
 
-# ========= CONFIGURACIÓN =========
 ROBOT_IP = "192.168.0.220"
-ROBOT_PORT_TELEMETRY = 6000    # Recibir imágenes
-ROBOT_PORT_CMD = 5007          # Enviar comandos
+ROBOT_PORT_TELEMETRY = 6000
+ROBOT_PORT_CMD = 5007
 
-# ========= PARÁMETROS DE CONTROL =========
-MAX_LINEAR_VEL = 2.0           # Velocidad lineal máxima (m/s) [0, 2] - Solo avance
-MAX_ANGULAR_VEL = 1.0          # Velocidad angular máxima (rad/s) [-1, 1] - Limitado para giros suaves
-KP_ANGULAR = 0.8               # Ganancia proporcional para giro (reducida para tracking suave)
-KP_LINEAR = 2.0                # Ganancia proporcional para avance
-MIN_CONFIDENCE = 0.5           # Confianza mínima de detección
-TARGET_AREA_RATIO = 0.20       # Área objetivo (20% del frame) - robot se acerca más
-STOP_THRESHOLD = 0.10          # Umbral para considerar centrado (más tolerante)
-SEARCH_ANGULAR_VEL = 0.3       # Velocidad de búsqueda cuando no hay robot (rad/s)
+# ========= PARÁMETROS DE CONTROL AGRESIVOS =========
+MAX_LINEAR_VEL = 2.0
+MAX_ANGULAR_VEL = 2.0          # AUMENTADO para giros más rápidos
+KP_ANGULAR = 2.5               # MUY AGRESIVO para seguir laterales
+KP_LINEAR = 3.0                # MÁS AGRESIVO para acelerar
+MIN_CONFIDENCE = 0.75          # 75% de confianza
+TARGET_AREA_RATIO = 0.15       # Área objetivo más pequeña (más cerca)
+STOP_THRESHOLD = 0.02          # MUY sensible para centrado
+SEARCH_ANGULAR_VEL = 0.8       # Búsqueda más rápida
+SEARCH_LINEAR_VEL = 0.5        # Movimiento más rápido en búsqueda
+SEARCH_TIMEOUT = 10.0
+
+# ========= PARÁMETROS KALMAN =========
+KALMAN_PROCESS_NOISE = 0.005   # MÁS SENSIBLE
+KALMAN_MEASUREMENT_NOISE = 0.05 # MÁS SENSIBLE
+KALMAN_STATE_TRANSITION = 60    # Más frames de predicción
+
+
+class KalmanFilterTracker:
+    """Filtro Kalman para suavizar tracking"""
+    
+    def __init__(self, img_width, img_height):
+        self.img_width = img_width
+        self.img_height = img_height
+        self.kf = KalmanFilter(dim_x=4, dim_z=2)
+        
+        # Estado: [cx, cy, width, height]
+        self.kf.x = np.array([[img_width/2], [img_height/2], [100], [100]], dtype=float)
+        
+        # Matriz de transición (posición + velocidad)
+        self.kf.F = np.array([[1., 0., 0.15, 0.],
+                              [0., 1., 0., 0.15],
+                              [0., 0., 1., 0.],
+                              [0., 0., 0., 1.]])
+        
+        # Matriz de medición (solo posición)
+        self.kf.H = np.array([[1., 0., 0., 0.],
+                              [0., 1., 0., 0.]])
+        
+        # Ruido de proceso
+        self.kf.Q *= KALMAN_PROCESS_NOISE
+        
+        # Ruido de medición
+        self.kf.R *= KALMAN_MEASUREMENT_NOISE
+        
+        # Covarianza inicial
+        self.kf.P *= 1.0
+        
+        self.frames_without_detection = 0
+        self.is_initialized = False
+    
+    def update(self, center_x, center_y, width, height):
+        """Actualiza Kalman con nueva detección"""
+        z = np.array([[center_x], [center_y]])
+        
+        if not self.is_initialized:
+            self.kf.x = np.array([[center_x], [center_y], [width], [height]], dtype=float)
+            self.is_initialized = True
+        
+        self.kf.predict()
+        self.kf.update(z)
+        self.frames_without_detection = 0
+    
+    def predict(self):
+        """Predice posición sin detección"""
+        self.kf.predict()
+        self.frames_without_detection += 1
+    
+    def get_position(self):
+        """Retorna posición predicha"""
+        cx = float(self.kf.x[0])
+        cy = float(self.kf.x[1])
+        w = float(self.kf.x[2])
+        h = float(self.kf.x[3])
+        
+        # Clampear a límites de imagen
+        cx = np.clip(cx, 0, self.img_width)
+        cy = np.clip(cy, 0, self.img_height)
+        
+        return cx, cy, w, h
+    
+    def is_valid(self):
+        """Revisa si la predicción es válida"""
+        return self.frames_without_detection < KALMAN_STATE_TRANSITION
+
 
 class Sender:
     """Envía comandos de movimiento al robot"""
@@ -46,20 +122,17 @@ class Sender:
         print("✅ [SENDER] Listo para enviar comandos")
     
     def send_cmd(self, vel: float, angular_vel: float):
-        # Clamp velocidades: vx solo puede ser [0, 2], no retrocede
-        v = max(min(vel, 2.0), 0.0)   # m/s - Solo avance
-        w = max(min(angular_vel, 1.0), -1.0)  # rad/s - Giros suaves
+        v = max(min(vel, 2.0), 0.0)
+        w = max(min(angular_vel, 2.0), -2.0)
 
-        # IMPORTANTE: El robot espera (angular, lineal) en el protocolo UDP
         payload = struct.pack('ff', w, v)
         try:
             self.sock.sendto(payload, self.robot_addr)
-            print(f"[SENDER] Enviado (v={v:+.3f}, w={w:+.3f})")
+            print(f"[SENDER] 🎯 v={v:+.2f}m/s | w={w:+.2f}rad/s")
         except Exception as e:
             print(f"[SENDER][ERROR] {e}")
     
     def stop(self):
-        """Detiene el robot"""
         self.send_cmd(0.0, 0.0)
     
     def close(self):
@@ -68,149 +141,162 @@ class Sender:
 
 
 class RobotController:
-    """Controla el movimiento del robot basado en tracking"""
+    """Controla el movimiento del robot con Kalman AGRESIVO"""
     
-    def __init__(self, sender, search_delay=1.5):
+    def __init__(self, sender):
         self.sender = sender
-        self.search_delay = search_delay  # Segundos antes de empezar a buscar
-        self.time_lost_tracking = None  # Timestamp cuando se perdió el tracking
-    
-    def calculate_control(self, tracking_info, img_width, img_height):
-        """
-        Calcula velocidades lineal y angular basadas en tracking_info.
-        
-        Args:
-            tracking_info: Dict con info del tracker o None si no hay robot
-            img_width: Ancho de la imagen
-            img_height: Alto de la imagen
-            
-        Returns:
-            tuple: (vx, wz, status)
-        """
-        if tracking_info is None:
-            # Sin robot trackeado
-            current_time = time.time()
-            
-            if self.time_lost_tracking is None:
-                # Recién perdimos el tracking
-                self.time_lost_tracking = current_time
-                return 0.0, 0.0, "ESPERANDO... ⏳"
-            
-            # Calcular tiempo sin tracking
-            time_without_robot = current_time - self.time_lost_tracking
-            
-            if time_without_robot < self.search_delay:
-                # Aún en periodo de espera
-                remaining = self.search_delay - time_without_robot
-                return 0.0, 0.0, f"ESPERANDO {remaining:.1f}s ⏳"
-            else:
-                # Ya pasó el delay, empezar a buscar
-                return 0.0, SEARCH_ANGULAR_VEL, "BUSCANDO 🔄"
-        
-        # Robot detectado/trackeado - resetear timer
         self.time_lost_tracking = None
+        self.search_start_time = None
+        self.search_direction = 1
+    
+    def calculate_control(self, tracking_info, kalman_tracker, img_width, img_height):
+        """Calcula velocidades AGRESIVAMENTE"""
         
-        # Extraer información del tracking
-        bbox = tracking_info['bbox']
-        center = tracking_info['center']
-        cx = center['x']
-        cy = center['y']
+        if tracking_info is not None:
+            # Hay detección NUEVA - actualizar Kalman
+            bbox = tracking_info['bbox']
+            center = tracking_info['center']
+            cx, cy = center['x'], center['y']
+            width = bbox['x2'] - bbox['x1']
+            height = bbox['y2'] - bbox['y1']
+            
+            kalman_tracker.update(cx, cy, width, height)
+            self.time_lost_tracking = None
+            self.search_start_time = None
+            source_emoji = "🎯"
+            
+        else:
+            # Sin detección - predecir con Kalman
+            kalman_tracker.predict()
+            
+            if not kalman_tracker.is_valid():
+                # Kalman expiró - entrar en modo búsqueda
+                current_time = time.time()
+                
+                if self.time_lost_tracking is None:
+                    self.time_lost_tracking = current_time
+                    self.search_start_time = current_time
+                
+                time_without_robot = current_time - self.time_lost_tracking
+                
+                if time_without_robot > SEARCH_TIMEOUT:
+                    # Timeout - resetear
+                    self.time_lost_tracking = None
+                    self.search_start_time = None
+                    self.search_direction = 1
+                
+                # BÚSQUEDA AGRESIVA: Girar + avanzar
+                return SEARCH_LINEAR_VEL, self.search_direction * SEARCH_ANGULAR_VEL, "🔄 BUSCANDO"
+            
+            source_emoji = "📡"
         
-        # Calcular dimensiones del bbox
-        width = bbox['x2'] - bbox['x1']
-        height = bbox['y2'] - bbox['y1']
+        # Usar posición de Kalman (suavizada)
+        cx, cy, width, height = kalman_tracker.get_position()
         area = width * height
         
-        # Calcular error horizontal (centrado)
+        # Calcular TODOS los errores
         frame_center_x = img_width / 2
+        frame_center_y = img_height / 2
+        
+        # ERROR HORIZONTAL (para girar)
         error_x = (cx - frame_center_x) / frame_center_x
         
-        # Calcular error de distancia (área)
-        # Si area < target_area: robot está lejos, debe avanzar (vx > 0)
-        # Si area >= target_area: robot está cerca, debe detenerse (vx = 0)
-        target_area = img_width * img_height * TARGET_AREA_RATIO
+        # ERROR VERTICAL (para ajuste fino)
+        error_y = (cy - frame_center_y) / frame_center_y
         
-        # Prevenir división por cero
+        target_area = img_width * img_height * TARGET_AREA_RATIO
         if target_area <= 0:
             target_area = 1.0
         
         area_ratio = area / target_area
         
-        # Debug: mostrar errores calculados
-        print(f"[CONTROL] error_x={error_x:.3f}, area_ratio={area_ratio:.3f}, area={area}, target={target_area:.0f}")
+        print(f"[CONTROL] 📍 Pos: ({cx:.0f},{cy:.0f}) | Error: X={error_x:+.3f} Y={error_y:+.3f} | Area_ratio={area_ratio:.3f}")
         
-        # Control proporcional
-        wz = np.clip(KP_ANGULAR * error_x, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
+        # ========== CONTROL AGRESIVO ==========
         
-        # vx proporcional a qué tan lejos está el robot (solo valores positivos)
-        if area_ratio < 1.0:
-            # Robot lejos, avanzar (más rápido si está muy lejos)
-            distance_error = 1.0 - area_ratio  # Siempre positivo cuando area_ratio < 1.0
-            vx_raw = KP_LINEAR * distance_error
-            vx = np.clip(vx_raw, 0.0, MAX_LINEAR_VEL)
-            print(f"[CONTROL] Robot lejos: distance_error={distance_error:.3f}, vx_raw={vx_raw:.3f}")
+        # GIRO AGRESIVO - Sigue lateralmente sin parar
+        wz_base = KP_ANGULAR * error_x
+        wz = np.clip(wz_base * 2.5, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)  # EXTRA agresivo
+        
+        # VELOCIDAD LINEAL AGRESIVA
+        if area_ratio < 0.7:
+            # Muy lejos - acelerar
+            distance_error = 1.0 - area_ratio
+            vx = np.clip(KP_LINEAR * distance_error * 1.5, 0.3, MAX_LINEAR_VEL)
+        elif area_ratio < 1.0:
+            # Lejos - avanzar normal
+            distance_error = 1.0 - area_ratio
+            vx = np.clip(KP_LINEAR * distance_error, 0.2, MAX_LINEAR_VEL)
         else:
-            # Robot cerca o muy cerca, detenerse
-            vx = 0.0
-            print(f"[CONTROL] Robot cerca: area_ratio={area_ratio:.3f} >= 1.0, deteniendo")
+            # Cerca o MUY cerca - frenar gradualmente
+            vx = 0.05  # Mínimo para mantener presencia
         
-        print(f"[CONTROL] Calculado FINAL: vx={vx:.3f}, wz={wz:.3f}")
-        
-        # Determinar estado
-        if abs(error_x) < STOP_THRESHOLD and abs(1.0 - area_ratio) < STOP_THRESHOLD:
-            vx = 0.0
+        # ========== NUNCA DETENERSE COMPLETAMENTE ==========
+        # Siempre hay velocidad angular para seguir
+        if abs(error_x) < STOP_THRESHOLD:
             wz = 0.0
-            status = "EN POSICIÓN ✅"
+            status = "✅ CENTRADO"
         else:
-            # Mostrar fuente del tracking
-            source_emoji = "🎯" if tracking_info['source'] == "yolo" else "📡"
-            status = f"TRACKING {source_emoji}"
+            status = f"🔥 SIGUIENDO {source_emoji}"
+        
+        if abs(1.0 - area_ratio) < 0.03:
+            vx = 0.0
+            status = "📍 DISTANCIA PERFECTA"
+        
+        print(f"[CONTROL] 🚀 vx={vx:.2f} | wz={wz:+.2f} | {status}")
         
         return vx, wz, status
     
     def execute_control(self, vx, wz):
-        """Envía comandos de control al robot"""
-        # Siempre enviar comandos (incluso 0,0 para detener)
-        print(f"[CONTROLLER] Ejecutando control: vx={vx:.3f}, wz={wz:.3f}")
         self.sender.send_cmd(vx, wz)
 
 
-def draw_control_hud(img, tracking_info, vx, wz, status):
-    """Dibuja HUD minimalista con información de control"""
+def draw_control_hud(img, tracking_info, vx, wz, status, kalman_valid):
+    """Dibuja HUD con toda la info"""
     h, w = img.shape[:2]
     
-    # Línea de centro vertical
-    cv2.line(img, (w//2, 0), (w//2, h), (100, 100, 100), 1)
+    # Línea de centro
+    cv2.line(img, (w//2, 0), (w//2, h), (100, 100, 100), 2)
+    cv2.line(img, (0, h//2), (w, h//2), (100, 100, 100), 2)
     
-    # HUD minimalista en la esquina
-    y_offset = 30
-    cv2.putText(img, f"vx: {vx:+.2f} m/s", (10, y_offset),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    # Velocidades en grande
+    y_offset = 40
+    cv2.putText(img, f"VELOCIDAD LINEAL: {vx:+.2f} m/s", (10, y_offset),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     
-    y_offset += 30
-    cv2.putText(img, f"wz: {wz:+.2f} rad/s", (10, y_offset),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    y_offset += 40
+    cv2.putText(img, f"VELOCIDAD ANGULAR: {wz:+.2f} rad/s", (10, y_offset),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
     
-    # Estado del sistema
-    if "TRACKING" in status:
-        color = (0, 255, 0)  # Verde
-    elif "POSICIÓN" in status:
-        color = (0, 255, 255)  # Amarillo
+    # Estado Kalman
+    kalman_color = (0, 255, 0) if kalman_valid else (0, 0, 255)
+    kalman_status = "✅ KALMAN ACTIVO" if kalman_valid else "⚠️ KALMAN EXPIRADO"
+    y_offset += 40
+    cv2.putText(img, kalman_status, (10, y_offset),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, kalman_color, 2)
+    
+    # Estado principal
+    if "SIGUIENDO" in status:
+        color = (0, 255, 0)
+    elif "CENTRADO" in status:
+        color = (0, 255, 255)
     elif "BUSCANDO" in status:
-        color = (0, 165, 255)  # Naranja
-    else:  # ESPERANDO
-        color = (200, 200, 200)  # Gris
+        color = (0, 165, 255)
+    elif "DISTANCIA" in status:
+        color = (255, 0, 0)
+    else:
+        color = (200, 200, 200)
     
-    cv2.putText(img, status, (10, h - 15),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    cv2.putText(img, status, (10, h - 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
     
     return img
+
 
 def do_handshake(sock: socket.socket, robot_addr):
     sock.settimeout(1.0)
     print(f"[HANDSHAKE] Iniciando con {robot_addr}...")
     while True:
-        # Enviar HELLO <domain> <pairing_code>
         msg = f"HELLO {DESIRED_DOMAIN_ID} {PAIRING_CODE}".encode("utf-8")
         sock.sendto(msg, robot_addr)
 
@@ -232,73 +318,29 @@ def do_handshake(sock: socket.socket, robot_addr):
                     continue
 
                 if domain_id != DESIRED_DOMAIN_ID:
-                    print(f"[HANDSHAKE] ROS_DOMAIN_ID no coincide "
-                          f"(esperado={DESIRED_DOMAIN_ID}, recibido={domain_id}). Reintentando...")
+                    print(f"[HANDSHAKE] ROS_DOMAIN_ID no coincide")
                     continue
 
                 if robot_name != EXPECTED_ROBOT_NAME:
-                    print(f"[HANDSHAKE] robot_name no coincide "
-                          f"(esperado={EXPECTED_ROBOT_NAME}, recibido={robot_name}). Reintentando...")
+                    print(f"[HANDSHAKE] robot_name no coincide")
                     continue
 
-                print(f"[HANDSHAKE] Emparejado con '{robot_name}' (domain {domain_id}).")
-                sock.settimeout(None)  # sin timeout para recibir telemetría
+                print(f"[HANDSHAKE] ✅ Emparejado con '{robot_name}' (domain {domain_id}).")
+                sock.settimeout(None)
                 return
             else:
-                print(f"[HANDSHAKE] Mensaje inesperado: '{text}', reintentando...")
+                print(f"[HANDSHAKE] Mensaje inesperado: '{text}'")
 
         except socket.timeout:
-            print("[HANDSHAKE] Timeout esperando ACK, reintentando...")
+            print("[HANDSHAKE] Timeout esperando ACK...")
 
         except KeyboardInterrupt:
-            print("[HANDSHAKE] Cancelado por el usuario.")
+            print("[HANDSHAKE] Cancelado por usuario.")
             raise
 
 
-def handle_scan(parts):
-    """
-    parts: lista de strings del mensaje:
-    SCAN <domain_id> <robot_name> <sec> <nsec> <angle_min> <angle_inc> <n> r1 ... rn
-    """
-    if len(parts) < 8:
-        print("[SCAN] Mensaje demasiado corto.")
-        return
-
-    try:
-        domain_id = int(parts[1])
-        robot_name = parts[2]
-        sec = int(parts[3])
-        nsec = int(parts[4])
-        angle_min = float(parts[5])
-        angle_inc = float(parts[6])
-        n = int(parts[7])
-
-        ranges_str = parts[8:]
-        if len(ranges_str) != n:
-            print(f"[SCAN] n={n} pero llegaron {len(ranges_str)} rangos. Usando min(len, n).")
-        n_effective = min(n, len(ranges_str))
-
-        ranges = [float(r) for r in ranges_str[:n_effective]]
-
-        # Aquí puedes hacer lo que quieras con el LIDAR.
-        # Demo: imprimir algunos valores cada vez.
-        print(f"[SCAN] robot={robot_name} domain={domain_id} "
-              f"t={sec}.{nsec:09d} n={n_effective} "
-              f"ejemplo={ranges[:5]}")
-
-    except ValueError as e:
-        print(f"[SCAN] Error parseando mensaje: {e}")
-
-
-def handle_img(parts, tracker, controller):
-    """
-    Procesa imagen con tracker híbrido y controla el movimiento.
-    
-    Args:
-        parts: lista de strings del mensaje IMG
-        tracker: HybridRobotTracker para tracking
-        controller: RobotController para enviar comandos
-    """
+def handle_img(parts, tracker, controller, kalman_tracker):
+    """Procesa imagen con Kalman AGRESIVO"""
     if len(parts) < 6:
         print("[IMG] Mensaje demasiado corto.")
         return
@@ -309,7 +351,6 @@ def handle_img(parts, tracker, controller):
         sec = int(parts[3])
         nsec = int(parts[4])
 
-        # Decodificar imagen
         b64_str = " ".join(parts[5:])
         jpeg_bytes = base64.b64decode(b64_str)
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
@@ -320,83 +361,79 @@ def handle_img(parts, tracker, controller):
             return
 
         h, w = img.shape[:2]
+        
+        if kalman_tracker.img_width != w or kalman_tracker.img_height != h:
+            kalman_tracker = KalmanFilterTracker(w, h)
 
-        # ===== TRACKING HÍBRIDO =====
         annotated_frame, tracking_info = tracker.process_frame(img)
         
-        # ===== CALCULAR CONTROL =====
-        vx, wz, status = controller.calculate_control(tracking_info, w, h)
+        vx, wz, status = controller.calculate_control(tracking_info, kalman_tracker, w, h)
         
-        # ===== EJECUTAR CONTROL =====
         controller.execute_control(vx, wz)
         
-        # ===== LOG =====
+        kalman_valid = kalman_tracker.is_valid()
+        
         if tracking_info:
             conf = tracking_info['confidence']
-            source = tracking_info['source']
-            print(f"[IMG] 🤖 Robot tracked [{source}] conf={conf:.2f} | "
-                  f"vx={vx:.2f} wz={wz:.2f} | {status}")
+            print(f"\n[IMG] 🎯 DETECTADO (conf={conf:.0%})")
         else:
-            print(f"[IMG] ❌ Sin tracking | {status}")
+            print(f"\n[IMG] 📡 PREDICIENDO CON KALMAN")
         
-        # ===== VISUALIZACIÓN =====
-        annotated_frame = draw_control_hud(annotated_frame, tracking_info, vx, wz, status)
-        cv2.imshow(f"🤖 Robot Tracker - {robot_name}", annotated_frame)
+        annotated_frame = draw_control_hud(annotated_frame, tracking_info, vx, wz, status, kalman_valid)
+        cv2.imshow(f"🤖 ROBOT TRACKER - SIGUIENDO AL PERRO", annotated_frame)
         cv2.waitKey(1)
 
     except Exception as e:
-        print(f"[IMG] Error manejando imagen: {e}")
+        print(f"[IMG] ❌ Error: {e}")
         import traceback
         traceback.print_exc()
 
 
 def main():
-    """
-    Función principal: inicializa componentes y ejecuta loop de telemetría.
-    """
-    print("\n" + "="*70)
-    print("🤖 ROBOT TRACKER - Sistema de Persecución con Tracking Híbrido")
-    print("="*70)
+    print("\n" + "="*80)
+    print("🐕 🤖 ROBOT TRACKER - SIGUE AL PERRO CON TODO")
+    print("="*80)
+    print("✅ Confianza: 75%")
+    print("✅ Kalman Filter activado")
+    print("✅ Seguimiento 360°")
+    print("✅ Búsqueda automática")
+    print("="*80)
     
-    # ===== INICIALIZAR TRACKER =====
-    print(f"\n[MAIN] Inicializando Hybrid Robot Tracker...")
     try:
         tracker = HybridRobotTracker(
             target_labels=["robots"],
-            conf_threshold_initial=0.7,
-            conf_threshold_redetect=0.5,
-            yolo_refresh_every=5,
+            conf_threshold_initial=0.75,
+            conf_threshold_redetect=0.75,
+            yolo_refresh_every=3,
             timeout_seconds=5.0,
             fps=30.0,
-            imgsz=416  # Más rápido que 640, suficiente para robots
+            imgsz=416
         )
-        print(f"✅ [MAIN] Tracker inicializado (usando MPS si disponible)")
+        print(f"\n✅ Tracker inicializado")
     except Exception as e:
-        print(f"❌ [MAIN] Error inicializando tracker: {e}")
+        print(f"❌ Error inicializando tracker: {e}")
         return
     
-    # ===== INICIALIZAR SENDER =====
     try:
         sender = Sender()
     except Exception as e:
-        print(f"❌ [MAIN] Error inicializando Sender: {e}")
+        print(f"❌ Error inicializando Sender: {e}")
         return
     
-    # ===== INICIALIZAR CONTROLLER =====
-    controller = RobotController(sender, search_delay=1.5)
-    print("✅ [MAIN] Sistema de control inicializado (delay: 1.5s)")
+    controller = RobotController(sender)
+    kalman_tracker = KalmanFilterTracker(640, 480)
     
-    # ===== CONFIGURAR SOCKET TELEMETRÍA =====
+    print("✅ Filtro Kalman inicializado")
+    print("✅ Robot Controller listo\n")
+    
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     robot_addr = (ROBOT_IP, ROBOT_PORT_TELEMETRY)
 
-    # ===== HANDSHAKE =====
     do_handshake(sock, robot_addr)
 
-    print("\n" + "="*70)
-    print("🟢 Sistema activo - Tracking híbrido con delay de 1.5s")
-    print("Presiona Ctrl+C para salir")
-    print("="*70 + "\n")
+    print("\n" + "="*80)
+    print("🟢 SISTEMA ACTIVO - ¡ROBOT LISTO PARA SEGUIR AL PERRO!")
+    print("="*80 + "\n")
     
     try:
         while True:
@@ -409,27 +446,23 @@ def main():
 
             msg_type = parts[0]
 
-            if msg_type == "SCAN":
-                handle_scan(parts)
-            elif msg_type == "IMG":
-                handle_img(parts, tracker, controller)
-            else:
-                print(f"[MAIN] Mensaje desconocido desde {addr}: '{msg_type}'")
+            if msg_type == "IMG":
+                handle_img(parts, tracker, controller, kalman_tracker)
 
     except KeyboardInterrupt:
-        print("\n\n🛑 [MAIN] Interrupción del usuario...")
+        print("\n\n🛑 Interrupción del usuario...")
     except Exception as e:
-        print(f"\n❌ [MAIN] Error en loop principal: {e}")
+        print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        print("🛑 [MAIN] Deteniendo robot...")
+        print("\n🛑 Deteniendo robot...")
         sender.stop()
         time.sleep(0.5)
         sender.close()
         sock.close()
         cv2.destroyAllWindows()
-        print("✅ [MAIN] Sistema cerrado correctamente\n")
+        print("✅ Sistema cerrado\n")
 
 
 if __name__ == "__main__":
