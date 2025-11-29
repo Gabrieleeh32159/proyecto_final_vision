@@ -1,57 +1,62 @@
-import socket
+import socket, struct
 import base64
 import time
+import sys
+import os
 
 import numpy as np
 import cv2
 from ultralytics import YOLO
 
-# ========= Configuración =========
-ROBOT_IP   = "10.182.184.103"  # IP del TurtleBot4
-ROBOT_PORT = 6000              # Debe coincidir con el nodo de telemetría
+# Import tracker
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from tracker import HybridRobotTracker
 
+# ========= Configuración =========
 DESIRED_DOMAIN_ID = 10          # Debe coincidir con ROS_DOMAIN_ID del robot
 PAIRING_CODE      = "ROBOT_A_100"
-EXPECTED_ROBOT_NAME = "turtlebot4_lite_10"  # por seguridad extra
+EXPECTED_ROBOT_NAME = "turtlebot4_lite_10"  # por seguriad extra
 
 # Modelo YOLO
 MODEL_PATH = "../best.pt"  # Ruta al modelo entrenado
 
 # ========= CONFIGURACIÓN =========
-ROBOT_IP = "10.182.184.103"
+ROBOT_IP = "192.168.0.220"
 ROBOT_PORT_TELEMETRY = 6000    # Recibir imágenes
 ROBOT_PORT_CMD = 5007          # Enviar comandos
 
 # ========= PARÁMETROS DE CONTROL =========
-MAX_LINEAR_VEL = 0.26          # Velocidad lineal máxima (m/s)
-MAX_ANGULAR_VEL = 1.0          # Velocidad angular máxima (rad/s)
-KP_ANGULAR = 2.0               # Ganancia proporcional para giro
-KP_LINEAR = 0.6                # Ganancia proporcional para avance
+MAX_LINEAR_VEL = 2.0           # Velocidad lineal máxima (m/s) [0, 2] - Solo avance
+MAX_ANGULAR_VEL = 1.0          # Velocidad angular máxima (rad/s) [-1, 1] - Limitado para giros suaves
+KP_ANGULAR = 0.8               # Ganancia proporcional para giro (reducida para tracking suave)
+KP_LINEAR = 2.0                # Ganancia proporcional para avance
 MIN_CONFIDENCE = 0.5           # Confianza mínima de detección
-TARGET_AREA_RATIO = 0.15       # Área objetivo (15% del frame)
-STOP_THRESHOLD = 0.05          # Umbral para considerar centrado
-SEARCH_ANGULAR_VEL = 0.3       # Velocidad de búsqueda cuando no hay robot
+TARGET_AREA_RATIO = 0.20       # Área objetivo (20% del frame) - robot se acerca más
+STOP_THRESHOLD = 0.10          # Umbral para considerar centrado (más tolerante)
+SEARCH_ANGULAR_VEL = 0.3       # Velocidad de búsqueda cuando no hay robot (rad/s)
 
 class Sender:
     """Envía comandos de movimiento al robot"""
     
     def __init__(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        robot_addr = (ROBOT_IP, ROBOT_PORT_CMD)
+        self.robot_addr = (ROBOT_IP, ROBOT_PORT_CMD)
         
-        print("\n📡 Realizando handshake con comandos...")
-        if not do_handshake(self.sock, robot_addr):
-            raise Exception("Handshake de comandos fallido")
-        
-        print("[SENDER] Listo para enviar comandos")
+        print(f"\n📡 [SENDER] Configurado para enviar comandos a {self.robot_addr}")
+        print("✅ [SENDER] Listo para enviar comandos")
     
-    def send_cmd(self, vx, wz):
-        """Envía comando de velocidad"""
+    def send_cmd(self, vel: float, angular_vel: float):
+        # Clamp velocidades: vx solo puede ser [0, 2], no retrocede
+        v = max(min(vel, 2.0), 0.0)   # m/s - Solo avance
+        w = max(min(angular_vel, 1.0), -1.0)  # rad/s - Giros suaves
+
+        # IMPORTANTE: El robot espera (angular, lineal) en el protocolo UDP
+        payload = struct.pack('ff', w, v)
         try:
-            msg = f"CMD {vx:.4f} {wz:.4f}".encode("utf-8")
-            self.sock.sendto(msg, (ROBOT_IP, ROBOT_PORT_CMD))
+            self.sock.sendto(payload, self.robot_addr)
+            print(f"[SENDER] Enviado (v={v:+.3f}, w={w:+.3f})")
         except Exception as e:
-            print(f"❌ Error enviando comando: {e}")
+            print(f"[SENDER][ERROR] {e}")
     
     def stop(self):
         """Detiene el robot"""
@@ -63,174 +68,143 @@ class Sender:
 
 
 class RobotController:
-    """Controla el movimiento del robot basado en detecciones de YOLO"""
+    """Controla el movimiento del robot basado en tracking"""
     
-    def __init__(self, sender):
+    def __init__(self, sender, search_delay=1.5):
         self.sender = sender
+        self.search_delay = search_delay  # Segundos antes de empezar a buscar
+        self.time_lost_tracking = None  # Timestamp cuando se perdió el tracking
     
-    def calculate_control(self, detections, img_width, img_height):
+    def calculate_control(self, tracking_info, img_width, img_height):
         """
-        Calcula velocidades lineal y angular basadas en detecciones.
+        Calcula velocidades lineal y angular basadas en tracking_info.
         
         Args:
-            detections: Lista de detecciones de YOLO
+            tracking_info: Dict con info del tracker o None si no hay robot
             img_width: Ancho de la imagen
             img_height: Alto de la imagen
             
         Returns:
             tuple: (vx, wz, status)
         """
-        if not detections:
-            # Sin robot detectado: buscar girando
-            return 0.0, SEARCH_ANGULAR_VEL, "BUSCANDO 🔄"
+        if tracking_info is None:
+            # Sin robot trackeado
+            current_time = time.time()
+            
+            if self.time_lost_tracking is None:
+                # Recién perdimos el tracking
+                self.time_lost_tracking = current_time
+                return 0.0, 0.0, "ESPERANDO... ⏳"
+            
+            # Calcular tiempo sin tracking
+            time_without_robot = current_time - self.time_lost_tracking
+            
+            if time_without_robot < self.search_delay:
+                # Aún en periodo de espera
+                remaining = self.search_delay - time_without_robot
+                return 0.0, 0.0, f"ESPERANDO {remaining:.1f}s ⏳"
+            else:
+                # Ya pasó el delay, empezar a buscar
+                return 0.0, SEARCH_ANGULAR_VEL, "BUSCANDO 🔄"
         
-        # Seleccionar el robot más grande (más cercano)
-        best_detection = max(detections, key=lambda d: d['area'])
+        # Robot detectado/trackeado - resetear timer
+        self.time_lost_tracking = None
+        
+        # Extraer información del tracking
+        bbox = tracking_info['bbox']
+        center = tracking_info['center']
+        cx = center['x']
+        cy = center['y']
+        
+        # Calcular dimensiones del bbox
+        width = bbox['x2'] - bbox['x1']
+        height = bbox['y2'] - bbox['y1']
+        area = width * height
         
         # Calcular error horizontal (centrado)
-        cx = best_detection['center_x']
         frame_center_x = img_width / 2
         error_x = (cx - frame_center_x) / frame_center_x
         
         # Calcular error de distancia (área)
-        area = best_detection['area']
+        # Si area < target_area: robot está lejos, debe avanzar (vx > 0)
+        # Si area >= target_area: robot está cerca, debe detenerse (vx = 0)
         target_area = img_width * img_height * TARGET_AREA_RATIO
-        error_area = (target_area - area) / target_area
+        
+        # Prevenir división por cero
+        if target_area <= 0:
+            target_area = 1.0
+        
+        area_ratio = area / target_area
+        
+        # Debug: mostrar errores calculados
+        print(f"[CONTROL] error_x={error_x:.3f}, area_ratio={area_ratio:.3f}, area={area}, target={target_area:.0f}")
         
         # Control proporcional
         wz = np.clip(KP_ANGULAR * error_x, -MAX_ANGULAR_VEL, MAX_ANGULAR_VEL)
-        vx = np.clip(KP_LINEAR * error_area, -MAX_LINEAR_VEL, MAX_LINEAR_VEL)
+        
+        # vx proporcional a qué tan lejos está el robot (solo valores positivos)
+        if area_ratio < 1.0:
+            # Robot lejos, avanzar (más rápido si está muy lejos)
+            distance_error = 1.0 - area_ratio  # Siempre positivo cuando area_ratio < 1.0
+            vx_raw = KP_LINEAR * distance_error
+            vx = np.clip(vx_raw, 0.0, MAX_LINEAR_VEL)
+            print(f"[CONTROL] Robot lejos: distance_error={distance_error:.3f}, vx_raw={vx_raw:.3f}")
+        else:
+            # Robot cerca o muy cerca, detenerse
+            vx = 0.0
+            print(f"[CONTROL] Robot cerca: area_ratio={area_ratio:.3f} >= 1.0, deteniendo")
+        
+        print(f"[CONTROL] Calculado FINAL: vx={vx:.3f}, wz={wz:.3f}")
         
         # Determinar estado
-        if abs(error_x) < STOP_THRESHOLD and abs(error_area) < STOP_THRESHOLD:
+        if abs(error_x) < STOP_THRESHOLD and abs(1.0 - area_ratio) < STOP_THRESHOLD:
             vx = 0.0
             wz = 0.0
             status = "EN POSICIÓN ✅"
         else:
-            status = "PERSIGUIENDO 🤖"
+            # Mostrar fuente del tracking
+            source_emoji = "🎯" if tracking_info['source'] == "yolo" else "📡"
+            status = f"TRACKING {source_emoji}"
         
         return vx, wz, status
     
     def execute_control(self, vx, wz):
         """Envía comandos de control al robot"""
+        # Siempre enviar comandos (incluso 0,0 para detener)
+        print(f"[CONTROLLER] Ejecutando control: vx={vx:.3f}, wz={wz:.3f}")
         self.sender.send_cmd(vx, wz)
 
 
-class DetectionProcessor:
-    """Procesa detecciones de YOLO y extrae información relevante"""
+def draw_control_hud(img, tracking_info, vx, wz, status):
+    """Dibuja HUD minimalista con información de control"""
+    h, w = img.shape[:2]
     
-    @staticmethod
-    def extract_detections(results, class_filter='robots'):
-        """
-        Extrae información de detecciones filtradas por clase.
-        
-        Args:
-            results: Resultados de YOLO
-            class_filter: Clase a filtrar (default: 'robots')
-            
-        Returns:
-            list: Lista de diccionarios con información de detecciones
-        """
-        detections = []
-        
-        for r in results:
-            for box in r.boxes:
-                # Obtener información de la caja
-                cls_id = int(box.cls[0])
-                cls_name = results[0].names[cls_id]
-                
-                # Filtrar por clase
-                if cls_name != class_filter:
-                    continue
-                
-                conf = float(box.conf[0])
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-                
-                # Calcular propiedades
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                width = x2 - x1
-                height = y2 - y1
-                area = width * height
-                
-                detection = {
-                    'class': cls_name,
-                    'confidence': conf,
-                    'bbox': (x1, y1, x2, y2),
-                    'center_x': cx,
-                    'center_y': cy,
-                    'width': width,
-                    'height': height,
-                    'area': area
-                }
-                detections.append(detection)
-        
-        return detections
+    # Línea de centro vertical
+    cv2.line(img, (w//2, 0), (w//2, h), (100, 100, 100), 1)
     
-    @staticmethod
-    def draw_detections(img, detections, vx, wz, status):
-        """
-        Dibuja detecciones y información de control en la imagen.
-        
-        Args:
-            img: Imagen OpenCV
-            detections: Lista de detecciones
-            vx: Velocidad lineal
-            wz: Velocidad angular
-            status: Estado del sistema
-            
-        Returns:
-            img: Imagen anotada
-        """
-        h, w = img.shape[:2]
-        
-        # Dibujar líneas de referencia (centro)
-        cv2.line(img, (w//2, 0), (w//2, h), (255, 0, 0), 2)
-        cv2.line(img, (0, h//2), (w, h//2), (255, 0, 0), 2)
-        
-        # Dibujar detecciones
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-            cx, cy = det['center_x'], det['center_y']
-            conf = det['confidence']
-            
-            # Bounding box verde
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            
-            # Centro del robot
-            cv2.circle(img, (cx, cy), 8, (0, 0, 255), -1)
-            
-            # Etiqueta con clase y confianza
-            label = f"ROBOT {conf:.0%}"
-            cv2.putText(img, label, (x1, y1 - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # HUD con información
-        y_offset = 40
-        cv2.putText(img, f"Robots: {len(detections)}", (15, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        
-        y_offset += 40
-        cv2.putText(img, f"vx: {vx:.3f} m/s", (15, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        y_offset += 35
-        cv2.putText(img, f"wz: {wz:.3f} rad/s", (15, y_offset),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Estado del sistema
-        if "PERSIGUIENDO" in status:
-            color = (0, 255, 255)  # Amarillo
-        elif "POSICIÓN" in status:
-            color = (0, 255, 0)    # Verde
-        else:  # BUSCANDO
-            color = (0, 165, 255)  # Naranja
-        
-        cv2.putText(img, f"Estado: {status}", (15, h - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        
-        return img
+    # HUD minimalista en la esquina
+    y_offset = 30
+    cv2.putText(img, f"vx: {vx:+.2f} m/s", (10, y_offset),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    y_offset += 30
+    cv2.putText(img, f"wz: {wz:+.2f} rad/s", (10, y_offset),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Estado del sistema
+    if "TRACKING" in status:
+        color = (0, 255, 0)  # Verde
+    elif "POSICIÓN" in status:
+        color = (0, 255, 255)  # Amarillo
+    elif "BUSCANDO" in status:
+        color = (0, 165, 255)  # Naranja
+    else:  # ESPERANDO
+        color = (200, 200, 200)  # Gris
+    
+    cv2.putText(img, status, (10, h - 15),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    
+    return img
 
 def do_handshake(sock: socket.socket, robot_addr):
     sock.settimeout(1.0)
@@ -316,13 +290,13 @@ def handle_scan(parts):
         print(f"[SCAN] Error parseando mensaje: {e}")
 
 
-def handle_img(parts, model, controller):
+def handle_img(parts, tracker, controller):
     """
-    Procesa imagen, detecta robots y controla el movimiento.
+    Procesa imagen con tracker híbrido y controla el movimiento.
     
     Args:
         parts: lista de strings del mensaje IMG
-        model: modelo YOLO para detección
+        tracker: HybridRobotTracker para tracking
         controller: RobotController para enviar comandos
     """
     if len(parts) < 6:
@@ -347,27 +321,27 @@ def handle_img(parts, model, controller):
 
         h, w = img.shape[:2]
 
-        # ===== DETECCIÓN CON YOLO =====
-        results = model(img, conf=MIN_CONFIDENCE, verbose=False)
-        detections = DetectionProcessor.extract_detections(results, class_filter='robots')
+        # ===== TRACKING HÍBRIDO =====
+        annotated_frame, tracking_info = tracker.process_frame(img)
         
         # ===== CALCULAR CONTROL =====
-        vx, wz, status = controller.calculate_control(detections, w, h)
+        vx, wz, status = controller.calculate_control(tracking_info, w, h)
         
         # ===== EJECUTAR CONTROL =====
         controller.execute_control(vx, wz)
         
         # ===== LOG =====
-        if detections:
-            best = max(detections, key=lambda d: d['area'])
-            print(f"[IMG] 🤖 {len(detections)} robot(s) | "
-                  f"vx={vx:.3f} wz={wz:.3f} | {status}")
+        if tracking_info:
+            conf = tracking_info['confidence']
+            source = tracking_info['source']
+            print(f"[IMG] 🤖 Robot tracked [{source}] conf={conf:.2f} | "
+                  f"vx={vx:.2f} wz={wz:.2f} | {status}")
         else:
-            print(f"[IMG] ❌ Sin robots | Buscando...")
+            print(f"[IMG] ❌ Sin tracking | {status}")
         
         # ===== VISUALIZACIÓN =====
-        annotated_img = DetectionProcessor.draw_detections(img, detections, vx, wz, status)
-        cv2.imshow(f"🤖 Robot Follower - {robot_name}", annotated_img)
+        annotated_frame = draw_control_hud(annotated_frame, tracking_info, vx, wz, status)
+        cv2.imshow(f"🤖 Robot Tracker - {robot_name}", annotated_frame)
         cv2.waitKey(1)
 
     except Exception as e:
@@ -381,21 +355,24 @@ def main():
     Función principal: inicializa componentes y ejecuta loop de telemetría.
     """
     print("\n" + "="*70)
-    print("🤖 ROBOT FOLLOWER - Sistema de Persecución Autónomo")
+    print("🤖 ROBOT TRACKER - Sistema de Persecución con Tracking Híbrido")
     print("="*70)
     
-    # ===== CARGAR MODELO YOLO =====
-    print(f"\n[MAIN] Cargando modelo YOLO desde {MODEL_PATH}...")
+    # ===== INICIALIZAR TRACKER =====
+    print(f"\n[MAIN] Inicializando Hybrid Robot Tracker...")
     try:
-        model = YOLO(MODEL_PATH)
-        print(f"✅ [MAIN] Modelo cargado. Clases: {model.names}")
-        
-        # Verificar clase 'robots'
-        if 'robots' not in model.names.values():
-            print(f"⚠️  Advertencia: Clase 'robots' no encontrada.")
-            print(f"   Clases disponibles: {list(model.names.values())}")
+        tracker = HybridRobotTracker(
+            target_labels=["robots"],
+            conf_threshold_initial=0.7,
+            conf_threshold_redetect=0.5,
+            yolo_refresh_every=5,
+            timeout_seconds=5.0,
+            fps=30.0,
+            imgsz=416  # Más rápido que 640, suficiente para robots
+        )
+        print(f"✅ [MAIN] Tracker inicializado (usando MPS si disponible)")
     except Exception as e:
-        print(f"❌ [MAIN] Error al cargar modelo: {e}")
+        print(f"❌ [MAIN] Error inicializando tracker: {e}")
         return
     
     # ===== INICIALIZAR SENDER =====
@@ -406,18 +383,18 @@ def main():
         return
     
     # ===== INICIALIZAR CONTROLLER =====
-    controller = RobotController(sender)
-    print("✅ [MAIN] Sistema de control inicializado")
+    controller = RobotController(sender, search_delay=1.5)
+    print("✅ [MAIN] Sistema de control inicializado (delay: 1.5s)")
     
     # ===== CONFIGURAR SOCKET TELEMETRÍA =====
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    robot_addr = (ROBOT_IP, ROBOT_PORT)
+    robot_addr = (ROBOT_IP, ROBOT_PORT_TELEMETRY)
 
     # ===== HANDSHAKE =====
     do_handshake(sock, robot_addr)
 
     print("\n" + "="*70)
-    print("🟢 Sistema activo - Recibiendo telemetría y persiguiendo robots")
+    print("🟢 Sistema activo - Tracking híbrido con delay de 1.5s")
     print("Presiona Ctrl+C para salir")
     print("="*70 + "\n")
     
@@ -435,7 +412,7 @@ def main():
             if msg_type == "SCAN":
                 handle_scan(parts)
             elif msg_type == "IMG":
-                handle_img(parts, model, controller)
+                handle_img(parts, tracker, controller)
             else:
                 print(f"[MAIN] Mensaje desconocido desde {addr}: '{msg_type}'")
 

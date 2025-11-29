@@ -30,7 +30,7 @@ class UdpTelemetryNode(Node):
         image_topic  = self.get_parameter("image_topic").get_parameter_value().string_value
 
         # ========= ROS_DOMAIN_ID =========
-        self.ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", "0"))
+        self.ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", "3"))
         self.get_logger().info(f"ROS_DOMAIN_ID detectado: {self.ros_domain_id}")
 
         # ========= Socket UDP =========
