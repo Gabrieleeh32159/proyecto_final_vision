@@ -1,0 +1,16 @@
+# Configuración optimizada de ByteTrack para seguimiento de robot
+# Optimizado para MacBook Air M3 con MPS
+
+tracker_type: bytetrack
+
+# Umbrales de detección - ajustados para robot único
+track_high_thresh: 0.5      # Umbral alto para primera asociación (robot claro)
+track_low_thresh: 0.1       # Umbral bajo para segunda pasada (recuperar oclusiones)
+new_track_thresh: 0.6       # Umbral para iniciar nuevo track (evita falsos positivos)
+
+# Buffer de tracking - cuántos frames mantener tracks perdidos
+track_buffer: 60            # 2 segundos a 30fps - tiempo para recuperar robot perdido
+
+# Asociación
+match_thresh: 0.85          # Umbral de matching IoU (alto = más estricto)
+fuse_score: true            # Fusionar score de detección con IoU
