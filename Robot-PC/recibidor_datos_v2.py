@@ -46,7 +46,7 @@ class ControlConfig:
     
     # Búsqueda cuando se pierde (gira 360° en una dirección)
     search_angular_vel: float = 0.15    # Velocidad de rotación en búsqueda (más lento)
-    lost_frames_threshold: int = 15     # Frames sin detección para activar búsqueda
+    lost_frames_threshold: int = 120     # Frames sin detección para activar búsqueda
     
     # Regreso cuando detecta en borde derecho durante búsqueda
     edge_threshold: float = 0.75        # Porcentaje del ancho para considerar "borde derecho"
@@ -349,7 +349,7 @@ class RobotTrackerV3:
         remaining = self.return_duration - elapsed
         print(f"[RETURN] Regresando: wz={wz:.2f}, restante={remaining:.2f}s")
         
-        return vx, wz, f"↩️ REGRESANDO [{remaining:.1f}s]"
+        return vx, wz, f"REGRESANDO [{remaining:.1f}s]"
     
     def _draw_hud(self, frame: np.ndarray, vx: float, wz: float, 
                   status: str, has_detection: bool) -> np.ndarray:
@@ -371,10 +371,10 @@ class RobotTrackerV3:
         # Indicador de estado
         y += 30
         if has_detection:
-            cv2.putText(frame, "🟢 PERRO DETECTADO", (10, y),
+            cv2.putText(frame, "PERRO DETECTADO", (10, y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         else:
-            cv2.putText(frame, "🔴 SIN DETECCION", (10, y),
+            cv2.putText(frame, "SIN DETECCION", (10, y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
         # FPS
